@@ -1,0 +1,85 @@
+# ══════════════════════════════════════════════════════════════
+#  Traefik v3 — Dynamic Configuration
+#  File: traefik/dynamic.yml
+#  Traefik watches this file and reloads it without restart
+# ══════════════════════════════════════════════════════════════
+
+http:
+  middlewares:
+
+    # ── Security headers (applied to all services) ─────────────
+    secure-headers:
+      headers:
+        sslRedirect: true
+        forceSTSHeader: true
+        stsSeconds: 63072000          # 2 years HSTS
+        stsIncludeSubdomains: true
+        stsPreload: true
+        frameDeny: true               # X-Frame-Options: DENY
+        contentTypeNosniff: true      # X-Content-Type-Options
+        browserXssFilter: true
+        referrerPolicy: "strict-origin-when-cross-origin"
+        permissionsPolicy: "camera=(), microphone=(), geolocation=()"
+        customResponseHeaders:
+          X-Powered-By: ""            # hide server info
+          Server: ""
+
+    # ── Rate limiter (protect API from abuse) ──────────────────
+    api-rate-limit:
+      rateLimit:
+        average: 100    # 100 requests per second on average
+        burst:    50    # allow bursts up to 50
+
+    # ── Compress responses ──────────────────────────────────────
+    compress:
+      compress: {}
+
+    # ── Basic Auth for Traefik dashboard ───────────────────────
+    #  Generate password: echo $(htpasswd -nb admin yourpassword)
+    #  Then replace the hash below
+    traefik-auth:
+      basicAuth:
+        users:
+          - "admin:$apr1$xyz$REPLACEME_WITH_HTPASSWD_HASH"
+
+    # ── Basic Auth for pgAdmin ─────────────────────────────────
+    pgadmin-auth:
+      basicAuth:
+        users:
+          - "admin:$apr1$xyz$REPLACEME_WITH_HTPASSWD_HASH"
+
+    # ── Strip /api prefix before forwarding to backend ─────────
+    strip-api-prefix:
+      stripPrefix:
+        prefixes:
+          - "/api"
+
+    # ── CORS for API subdomain ─────────────────────────────────
+    cors-headers:
+      headers:
+        accessControlAllowMethods:
+          - GET
+          - POST
+          - PATCH
+          - DELETE
+          - OPTIONS
+        accessControlAllowHeaders:
+          - "Content-Type"
+          - "Authorization"
+        accessControlAllowOriginList:
+          - "https://app.${DOMAIN}"
+          - "https://${DOMAIN}"
+        accessControlMaxAge: 86400
+        addVaryHeader: true
+
+tls:
+  options:
+    default:
+      minVersion: VersionTLS12
+      cipherSuites:
+        - TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384
+        - TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+        - TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305
+        - TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305
+        - TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256
+        - TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256

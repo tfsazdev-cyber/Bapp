@@ -1,0 +1,151 @@
+version: '3.9'
+
+# ══════════════════════════════════════════════════════════════════
+#  BDA Portal — Production Docker Compose
+#  File: docker-compose.prod.yml
+#
+#  DIFFERENCE FROM docker-compose.yml:
+#    - Uses pre-built images from Docker Hub (no "build:" section)
+#    - Traefik handles HTTPS with your real domain
+#    - Database and pgAdmin same as before
+#
+#  HOW TO USE ON YOUR SERVER:
+#    docker compose -f docker-compose.prod.yml pull
+#    docker compose -f docker-compose.prod.yml up -d
+# ══════════════════════════════════════════════════════════════════
+
+services:
+
+  # ── 1. TRAEFIK ─────────────────────────────────────────────────
+  traefik:
+    image: traefik:v3.0
+    container_name: bda_traefik
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
+      - ./traefik/dynamic.yml:/etc/traefik/dynamic.yml:ro
+      - letsencrypt:/letsencrypt
+      - traefik_logs:/var/log/traefik
+    environment:
+      DOMAIN:     ${DOMAIN}
+      ACME_EMAIL: ${ACME_EMAIL}
+    networks:
+      - bda_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.traefik-dash.rule=Host(`traefik.${DOMAIN}`)"
+      - "traefik.http.routers.traefik-dash.entrypoints=websecure"
+      - "traefik.http.routers.traefik-dash.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.traefik-dash.service=api@internal"
+      - "traefik.http.routers.traefik-dash.middlewares=traefik-auth@file,secure-headers@file"
+
+  # ── 2. FRONTEND — pulled from Docker Hub ───────────────────────
+  frontend:
+    image: ${DOCKERHUB_USERNAME}/bda-frontend:latest   # ← from Docker Hub
+    container_name: bda_frontend
+    restart: unless-stopped
+    depends_on:
+      backend:
+        condition: service_healthy
+    networks:
+      - bda_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.frontend.rule=Host(`app.${DOMAIN}`) || Host(`${DOMAIN}`)"
+      - "traefik.http.routers.frontend.entrypoints=websecure"
+      - "traefik.http.routers.frontend.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.frontend.middlewares=secure-headers@file,compress@file"
+      - "traefik.http.services.frontend.loadbalancer.server.port=80"
+
+  # ── 3. BACKEND — pulled from Docker Hub ────────────────────────
+  backend:
+    image: ${DOCKERHUB_USERNAME}/bda-backend:latest    # ← from Docker Hub
+    container_name: bda_backend
+    restart: unless-stopped
+    environment:
+      NODE_ENV:    production
+      PORT:        3000
+      JWT_SECRET:  ${JWT_SECRET}
+      DB_HOST:     database
+      DB_PORT:     5432
+      DB_NAME:     ${POSTGRES_DB:-bda}
+      DB_USER:     ${POSTGRES_USER:-bda_user}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+    depends_on:
+      database:
+        condition: service_healthy
+    networks:
+      - bda_network
+    healthcheck:
+      test:         ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000/health"]
+      interval:     20s
+      timeout:      8s
+      retries:      5
+      start_period: 15s
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.backend.rule=Host(`api.${DOMAIN}`)"
+      - "traefik.http.routers.backend.entrypoints=websecure"
+      - "traefik.http.routers.backend.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.backend.middlewares=secure-headers@file,api-rate-limit@file,cors-headers@file"
+      - "traefik.http.services.backend.loadbalancer.server.port=3000"
+
+  # ── 4. DATABASE — official image, no Hub push needed ───────────
+  database:
+    image: postgres:16-alpine
+    container_name: bda_database
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB:       ${POSTGRES_DB:-bda}
+      POSTGRES_USER:     ${POSTGRES_USER:-bda_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      - bda_network
+    healthcheck:
+      test:         ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-bda_user} -d ${POSTGRES_DB:-bda}"]
+      interval:     10s
+      timeout:      5s
+      retries:      5
+      start_period: 10s
+
+  # ── 5. PGADMIN ─────────────────────────────────────────────────
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    container_name: bda_pgadmin
+    restart: unless-stopped
+    environment:
+      PGADMIN_DEFAULT_EMAIL:    ${PGADMIN_EMAIL}
+      PGADMIN_DEFAULT_PASSWORD: ${PGADMIN_PASSWORD}
+      PGADMIN_CONFIG_SERVER_MODE: "False"
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    depends_on:
+      database:
+        condition: service_healthy
+    networks:
+      - bda_network
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.pgadmin.rule=Host(`db.${DOMAIN}`)"
+      - "traefik.http.routers.pgadmin.entrypoints=websecure"
+      - "traefik.http.routers.pgadmin.tls.certresolver=letsencrypt"
+      - "traefik.http.routers.pgadmin.middlewares=secure-headers@file,pgadmin-auth@file"
+      - "traefik.http.services.pgadmin.loadbalancer.server.port=80"
+
+volumes:
+  db_data:      { name: bda_db_data }
+  pgadmin_data: { name: bda_pgadmin_data }
+  letsencrypt:  { name: bda_letsencrypt }
+  traefik_logs: { name: bda_traefik_logs }
+
+networks:
+  bda_network:
+    driver: bridge
+    name: bda_network

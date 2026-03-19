@@ -1,0 +1,161 @@
+# ══════════════════════════════════════════════════════════════════
+#  BDA Portal — Azure Pipelines CI/CD
+#  File: azure-pipelines.yml  (put this in your repo root)
+#
+#  WHAT THIS DOES (same as GitHub Actions version):
+#    On every push to "main":
+#      1. Builds frontend Docker image
+#      2. Builds backend Docker image
+#      3. Pushes both to Docker Hub
+#      4. SSHes to your server and restarts containers
+#
+#  VARIABLES TO SET IN AZURE DEVOPS:
+#    Go to: Pipelines → your pipeline → Edit → Variables
+#    Add these as Secret variables (click the lock icon):
+#
+#    DOCKERHUB_USERNAME   → your Docker Hub username
+#    DOCKERHUB_TOKEN      → Docker Hub access token
+#    SERVER_HOST          → your server IP or domain
+#    SERVER_USER          → SSH login user (root / ubuntu)
+#    SERVER_SSH_KEY       → your private SSH key content
+#    SERVER_DEPLOY_PATH   → e.g. /opt/bda-app
+#    DOMAIN               → e.g. yourdomain.com
+#    JWT_SECRET           → your JWT secret
+#    POSTGRES_PASSWORD    → your DB password
+#    PGADMIN_EMAIL        → pgAdmin login email
+#    PGADMIN_PASSWORD     → pgAdmin login password
+# ══════════════════════════════════════════════════════════════════
+
+trigger:
+  branches:
+    include:
+      - main        # run on every push to main
+
+pr:
+  branches:
+    include:
+      - main        # build (no deploy) on PRs to main
+
+pool:
+  vmImage: ubuntu-latest
+
+variables:
+  frontendImage: $(DOCKERHUB_USERNAME)/bda-frontend
+  backendImage:  $(DOCKERHUB_USERNAME)/bda-backend
+  imageTag:      $(Build.SourceVersion)   # full commit SHA
+
+stages:
+
+  # ══════════════════════════════════════════════════════════════
+  #  STAGE 1 — BUILD & PUSH
+  # ══════════════════════════════════════════════════════════════
+  - stage: Build
+    displayName: Build and Push Docker Images
+    jobs:
+      - job: BuildPush
+        displayName: Build & Push to Docker Hub
+        steps:
+
+          # Step 1 — Log in to Docker Hub
+          - script: |
+              echo "$(DOCKERHUB_TOKEN)" | docker login \
+                --username "$(DOCKERHUB_USERNAME)" \
+                --password-stdin
+            displayName: Log in to Docker Hub
+            env:
+              DOCKERHUB_TOKEN: $(DOCKERHUB_TOKEN)
+
+          # Step 2 — Short commit SHA for tagging
+          - script: |
+              SHORT_SHA=$(echo "$(Build.SourceVersion)" | cut -c1-7)
+              echo "##vso[task.setvariable variable=shortSha]$SHORT_SHA"
+            displayName: Generate short SHA
+
+          # Step 3 — Build and push FRONTEND
+          - script: |
+              docker build \
+                -t $(frontendImage):latest \
+                -t $(frontendImage):$(shortSha) \
+                ./frontend
+
+              docker push $(frontendImage):latest
+              docker push $(frontendImage):$(shortSha)
+            displayName: Build & push frontend image
+
+          # Step 4 — Build and push BACKEND
+          - script: |
+              docker build \
+                -t $(backendImage):latest \
+                -t $(backendImage):$(shortSha) \
+                ./backend
+
+              docker push $(backendImage):latest
+              docker push $(backendImage):$(shortSha)
+            displayName: Build & push backend image
+
+          # Step 5 — Log out of Docker Hub
+          - script: docker logout
+            displayName: Docker logout
+            condition: always()
+
+          # Step 6 — Summary
+          - script: |
+              echo "✅ Images pushed to Docker Hub:"
+              echo "   $(frontendImage):latest"
+              echo "   $(frontendImage):$(shortSha)"
+              echo "   $(backendImage):latest"
+              echo "   $(backendImage):$(shortSha)"
+            displayName: Print image summary
+
+  # ══════════════════════════════════════════════════════════════
+  #  STAGE 2 — DEPLOY  (only on main branch, after build passes)
+  # ══════════════════════════════════════════════════════════════
+  - stage: Deploy
+    displayName: Deploy to Server
+    dependsOn: Build
+    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+    jobs:
+      - deployment: DeployToServer
+        displayName: SSH Deploy
+        environment: production     # creates an Azure environment for approvals
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+
+                # Write SSH private key to a temp file
+                - script: |
+                    mkdir -p ~/.ssh
+                    echo "$(SERVER_SSH_KEY)" > ~/.ssh/deploy_key
+                    chmod 600 ~/.ssh/deploy_key
+                    ssh-keyscan -H $(SERVER_HOST) >> ~/.ssh/known_hosts
+                  displayName: Setup SSH key
+                  env:
+                    SERVER_SSH_KEY: $(SERVER_SSH_KEY)
+
+                # SSH into server and deploy
+                - script: |
+                    ssh -i ~/.ssh/deploy_key \
+                        -o StrictHostKeyChecking=no \
+                        $(SERVER_USER)@$(SERVER_HOST) << 'ENDSSH'
+                      set -e
+                      cd $(SERVER_DEPLOY_PATH)
+
+                      echo "📥 Pulling latest images from Docker Hub..."
+                      docker compose -f docker-compose.prod.yml pull frontend backend
+
+                      echo "🔄 Restarting containers with new images..."
+                      docker compose -f docker-compose.prod.yml up -d --no-build frontend backend
+
+                      echo "🧹 Removing old unused images..."
+                      docker image prune -f
+
+                      echo "✅ Deployment complete!"
+                      docker compose -f docker-compose.prod.yml ps
+                  ENDSSH
+                  displayName: Deploy via SSH
+
+                # Clean up SSH key
+                - script: rm -f ~/.ssh/deploy_key
+                  displayName: Remove SSH key
+                  condition: always()
