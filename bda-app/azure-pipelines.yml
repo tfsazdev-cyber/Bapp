@@ -1,161 +1,167 @@
-# ══════════════════════════════════════════════════════════════════
-#  BDA Portal — Azure Pipelines CI/CD
-#  File: azure-pipelines.yml  (put this in your repo root)
-#
-#  WHAT THIS DOES (same as GitHub Actions version):
-#    On every push to "main":
-#      1. Builds frontend Docker image
-#      2. Builds backend Docker image
-#      3. Pushes both to Docker Hub
-#      4. SSHes to your server and restarts containers
-#
-#  VARIABLES TO SET IN AZURE DEVOPS:
-#    Go to: Pipelines → your pipeline → Edit → Variables
-#    Add these as Secret variables (click the lock icon):
-#
-#    DOCKERHUB_USERNAME   → your Docker Hub username
-#    DOCKERHUB_TOKEN      → Docker Hub access token
-#    SERVER_HOST          → your server IP or domain
-#    SERVER_USER          → SSH login user (root / ubuntu)
-#    SERVER_SSH_KEY       → your private SSH key content
-#    SERVER_DEPLOY_PATH   → e.g. /opt/bda-app
-#    DOMAIN               → e.g. yourdomain.com
-#    JWT_SECRET           → your JWT secret
-#    POSTGRES_PASSWORD    → your DB password
-#    PGADMIN_EMAIL        → pgAdmin login email
-#    PGADMIN_PASSWORD     → pgAdmin login password
-# ══════════════════════════════════════════════════════════════════
-
 trigger:
   branches:
     include:
-      - main        # run on every push to main
+      - main
+  paths:
+    exclude:
+      - '*.md'
 
 pr:
   branches:
     include:
-      - main        # build (no deploy) on PRs to main
-
-pool:
-  vmImage: ubuntu-latest
+      - main
 
 variables:
-  frontendImage: $(DOCKERHUB_USERNAME)/bda-frontend
-  backendImage:  $(DOCKERHUB_USERNAME)/bda-backend
-  imageTag:      $(Build.SourceVersion)   # full commit SHA
+  - group: bda-vars          # links your variable group
+  - name: frontendImage
+    value: '$(DOCKERHUB_USERNAME)/bda-frontend'
+  - name: backendImage
+    value: '$(DOCKERHUB_USERNAME)/bda-backend'
+  - name: imageTag
+    value: '$(Build.BuildId)'
 
 stages:
 
-  # ══════════════════════════════════════════════════════════════
-  #  STAGE 1 — BUILD & PUSH
-  # ══════════════════════════════════════════════════════════════
-  - stage: Build
-    displayName: Build and Push Docker Images
-    jobs:
-      - job: BuildPush
-        displayName: Build & Push to Docker Hub
-        steps:
+# ---------------------------------------------------------------
+# STAGE 1 - TEST
+# ---------------------------------------------------------------
+- stage: Test
+  displayName: 'Test'
+  jobs:
+  - job: SmokeTest
+    displayName: 'Backend smoke test'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
 
-          # Step 1 — Log in to Docker Hub
+    - task: NodeTool@0
+      displayName: 'Use Node.js 20'
+      inputs:
+        versionSpec: '20.x'
+
+    - script: |
+        cd backend
+        npm install
+      displayName: 'npm install'
+
+    - script: |
+        cd backend
+        NODE_ENV=test JWT_SECRET=ci_test PORT=3001 node server.js &
+        PID=$!
+        sleep 4
+        RESP=$(curl -sf http://localhost:3001/health)
+        echo "Response: $RESP"
+        kill $PID
+        echo "$RESP" | grep -q '"status":"ok"'
+        echo "Smoke test passed"
+      displayName: 'Health check smoke test'
+
+# ---------------------------------------------------------------
+# STAGE 2 - BUILD AND PUSH TO DOCKER HUB
+# ---------------------------------------------------------------
+- stage: Build
+  displayName: 'Build and Push to Docker Hub'
+  dependsOn: Test
+  condition: succeeded()
+  jobs:
+  - job: BuildAndPush
+    displayName: 'Build images and push to Docker Hub'
+    pool:
+      vmImage: 'ubuntu-latest'
+    steps:
+
+    - task: Docker@2
+      displayName: 'Login to Docker Hub'
+      inputs:
+        command:           login
+        containerRegistry: $(DOCKERHUB_SERVICE_CONNECTION)
+
+    - task: Docker@2
+      displayName: 'Build and push bda-frontend'
+      inputs:
+        command:           buildAndPush
+        repository:        $(frontendImage)
+        dockerfile:        frontend/Dockerfile
+        containerRegistry: $(DOCKERHUB_SERVICE_CONNECTION)
+        tags: |
+          $(imageTag)
+          latest
+
+    - task: Docker@2
+      displayName: 'Build and push bda-backend'
+      inputs:
+        command:           buildAndPush
+        repository:        $(backendImage)
+        dockerfile:        backend/Dockerfile
+        containerRegistry: $(DOCKERHUB_SERVICE_CONNECTION)
+        tags: |
+          $(imageTag)
+          latest
+
+    - script: |
+        echo "Images pushed to Docker Hub:"
+        echo "  docker.io/$(frontendImage):$(imageTag)"
+        echo "  docker.io/$(frontendImage):latest"
+        echo "  docker.io/$(backendImage):$(imageTag)"
+        echo "  docker.io/$(backendImage):latest"
+      displayName: 'Print image tags'
+
+# ---------------------------------------------------------------
+# STAGE 3 - DEPLOY TO PRODUCTION SERVER
+# ---------------------------------------------------------------
+- stage: Deploy
+  displayName: 'Deploy to Production'
+  dependsOn: Build
+  condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
+  jobs:
+  - deployment: Production
+    displayName: 'Deploy to VPS via SSH'
+    pool:
+      vmImage: 'ubuntu-latest'
+    environment: 'production'
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+
+          - task: SSH@0
+            displayName: 'SSH - pull images and restart containers'
+            inputs:
+              sshEndpoint: $(SSH_SERVICE_CONNECTION)
+              runOptions:  inline
+              inline: |
+                set -e
+                echo "BDA Portal - Deploying build $(Build.BuildId)"
+                echo "Time: $(date)"
+
+                cd /opt/bda-app
+
+                git pull origin main
+
+                echo "$(DOCKERHUB_PASSWORD)" | docker login -u "$(DOCKERHUB_USERNAME)" --password-stdin
+
+                docker pull $(frontendImage):latest
+                docker pull $(backendImage):latest
+
+                FRONTEND_IMAGE=$(frontendImage):latest BACKEND_IMAGE=$(backendImage):latest docker compose up -d --no-build frontend backend
+
+                sleep 5
+                docker compose ps
+                docker image prune -f
+
+                echo "Deployment complete - build $(Build.BuildId)"
+
           - script: |
-              echo "$(DOCKERHUB_TOKEN)" | docker login \
-                --username "$(DOCKERHUB_USERNAME)" \
-                --password-stdin
-            displayName: Log in to Docker Hub
+              sleep 10
+              echo "Checking API health..."
+              STATUS=$(curl -s -o /dev/null -w "%{http_code}" https://api.$(DOMAIN)/health || echo "000")
+              echo "HTTP Status: $STATUS"
+              if [ "$STATUS" = "200" ]; then
+                echo "API is live and healthy"
+              else
+                echo "Health check FAILED - HTTP $STATUS"
+                exit 1
+              fi
+            displayName: 'Post-deploy health check'
             env:
-              DOCKERHUB_TOKEN: $(DOCKERHUB_TOKEN)
-
-          # Step 2 — Short commit SHA for tagging
-          - script: |
-              SHORT_SHA=$(echo "$(Build.SourceVersion)" | cut -c1-7)
-              echo "##vso[task.setvariable variable=shortSha]$SHORT_SHA"
-            displayName: Generate short SHA
-
-          # Step 3 — Build and push FRONTEND
-          - script: |
-              docker build \
-                -t $(frontendImage):latest \
-                -t $(frontendImage):$(shortSha) \
-                ./frontend
-
-              docker push $(frontendImage):latest
-              docker push $(frontendImage):$(shortSha)
-            displayName: Build & push frontend image
-
-          # Step 4 — Build and push BACKEND
-          - script: |
-              docker build \
-                -t $(backendImage):latest \
-                -t $(backendImage):$(shortSha) \
-                ./backend
-
-              docker push $(backendImage):latest
-              docker push $(backendImage):$(shortSha)
-            displayName: Build & push backend image
-
-          # Step 5 — Log out of Docker Hub
-          - script: docker logout
-            displayName: Docker logout
-            condition: always()
-
-          # Step 6 — Summary
-          - script: |
-              echo "✅ Images pushed to Docker Hub:"
-              echo "   $(frontendImage):latest"
-              echo "   $(frontendImage):$(shortSha)"
-              echo "   $(backendImage):latest"
-              echo "   $(backendImage):$(shortSha)"
-            displayName: Print image summary
-
-  # ══════════════════════════════════════════════════════════════
-  #  STAGE 2 — DEPLOY  (only on main branch, after build passes)
-  # ══════════════════════════════════════════════════════════════
-  - stage: Deploy
-    displayName: Deploy to Server
-    dependsOn: Build
-    condition: and(succeeded(), eq(variables['Build.SourceBranch'], 'refs/heads/main'))
-    jobs:
-      - deployment: DeployToServer
-        displayName: SSH Deploy
-        environment: production     # creates an Azure environment for approvals
-        strategy:
-          runOnce:
-            deploy:
-              steps:
-
-                # Write SSH private key to a temp file
-                - script: |
-                    mkdir -p ~/.ssh
-                    echo "$(SERVER_SSH_KEY)" > ~/.ssh/deploy_key
-                    chmod 600 ~/.ssh/deploy_key
-                    ssh-keyscan -H $(SERVER_HOST) >> ~/.ssh/known_hosts
-                  displayName: Setup SSH key
-                  env:
-                    SERVER_SSH_KEY: $(SERVER_SSH_KEY)
-
-                # SSH into server and deploy
-                - script: |
-                    ssh -i ~/.ssh/deploy_key \
-                        -o StrictHostKeyChecking=no \
-                        $(SERVER_USER)@$(SERVER_HOST) << 'ENDSSH'
-                      set -e
-                      cd $(SERVER_DEPLOY_PATH)
-
-                      echo "📥 Pulling latest images from Docker Hub..."
-                      docker compose -f docker-compose.prod.yml pull frontend backend
-
-                      echo "🔄 Restarting containers with new images..."
-                      docker compose -f docker-compose.prod.yml up -d --no-build frontend backend
-
-                      echo "🧹 Removing old unused images..."
-                      docker image prune -f
-
-                      echo "✅ Deployment complete!"
-                      docker compose -f docker-compose.prod.yml ps
-                  ENDSSH
-                  displayName: Deploy via SSH
-
-                # Clean up SSH key
-                - script: rm -f ~/.ssh/deploy_key
-                  displayName: Remove SSH key
-                  condition: always()
+              DOMAIN: $(DOMAIN)
