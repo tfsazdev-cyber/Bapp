@@ -12,7 +12,7 @@ pr:
       - main
 
 variables:
-  - group: bda-vars          # links your variable group
+  - group: bda-vars
   - name: frontendImage
     value: '$(DOCKERHUB_USERNAME)/bda-frontend'
   - name: backendImage
@@ -39,21 +39,35 @@ stages:
       inputs:
         versionSpec: '20.x'
 
+    # Show repo structure so we know exact paths
     - script: |
-        cd backend
+        echo "====== Repo root ======"
+        ls -la $(Build.SourcesDirectory)
+        echo ""
+        echo "====== Looking for package.json ======"
+        find $(Build.SourcesDirectory) -name "package.json" -not -path "*/node_modules/*"
+      displayName: 'Show repo structure'
+
+    # Auto-detect backend folder and install
+    - script: |
+        BACKEND=$(find $(Build.SourcesDirectory) -name "package.json" -not -path "*/node_modules/*" | head -1 | xargs dirname)
+        echo "Backend found at: $BACKEND"
+        cd $BACKEND
         npm install
       displayName: 'npm install'
 
+    # Auto-detect backend folder and smoke test
     - script: |
-        cd backend
+        BACKEND=$(find $(Build.SourcesDirectory) -name "package.json" -not -path "*/node_modules/*" | head -1 | xargs dirname)
+        echo "Backend found at: $BACKEND"
+        cd $BACKEND
         NODE_ENV=test JWT_SECRET=ci_test PORT=3001 node server.js &
         PID=$!
         sleep 4
-        RESP=$(curl -sf http://localhost:3001/health)
+        RESP=$(curl -sf http://localhost:3001/health || echo "FAILED")
         echo "Response: $RESP"
-        kill $PID
-        echo "$RESP" | grep -q '"status":"ok"'
-        echo "Smoke test passed"
+        kill $PID 2>/dev/null || true
+        echo "$RESP" | grep -q '"status":"ok"' && echo "Smoke test passed" || (echo "Smoke test failed" && exit 1)
       displayName: 'Health check smoke test'
 
 # ---------------------------------------------------------------
@@ -70,33 +84,37 @@ stages:
       vmImage: 'ubuntu-latest'
     steps:
 
+    # Show structure again so we know Dockerfile locations
+    - script: |
+        echo "====== Looking for Dockerfiles ======"
+        find $(Build.SourcesDirectory) -name "Dockerfile"
+      displayName: 'Show Dockerfile locations'
+
     - task: Docker@2
       displayName: 'Login to Docker Hub'
       inputs:
         command:           login
         containerRegistry: $(DOCKERHUB_SERVICE_CONNECTION)
 
-    - task: Docker@2
+    # Build + push FRONTEND — auto-detect context path
+    - script: |
+        FRONTEND_DIR=$(find $(Build.SourcesDirectory) -path "*/frontend/Dockerfile" | head -1 | xargs dirname)
+        echo "Frontend dir: $FRONTEND_DIR"
+        docker build -t $(frontendImage):$(imageTag) -t $(frontendImage):latest $FRONTEND_DIR
+        docker push $(frontendImage):$(imageTag)
+        docker push $(frontendImage):latest
+        echo "Pushed $(frontendImage):$(imageTag)"
       displayName: 'Build and push bda-frontend'
-      inputs:
-        command:           buildAndPush
-        repository:        $(frontendImage)
-        dockerfile:        frontend/Dockerfile
-        containerRegistry: $(DOCKERHUB_SERVICE_CONNECTION)
-        tags: |
-          $(imageTag)
-          latest
 
-    - task: Docker@2
+    # Build + push BACKEND — auto-detect context path
+    - script: |
+        BACKEND_DIR=$(find $(Build.SourcesDirectory) -path "*/backend/Dockerfile" | head -1 | xargs dirname)
+        echo "Backend dir: $BACKEND_DIR"
+        docker build -t $(backendImage):$(imageTag) -t $(backendImage):latest $BACKEND_DIR
+        docker push $(backendImage):$(imageTag)
+        docker push $(backendImage):latest
+        echo "Pushed $(backendImage):$(imageTag)"
       displayName: 'Build and push bda-backend'
-      inputs:
-        command:           buildAndPush
-        repository:        $(backendImage)
-        dockerfile:        backend/Dockerfile
-        containerRegistry: $(DOCKERHUB_SERVICE_CONNECTION)
-        tags: |
-          $(imageTag)
-          latest
 
     - script: |
         echo "Images pushed to Docker Hub:"
